@@ -1,0 +1,296 @@
+name: AI Agent CI/CD - Microsoft Foundry
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: 'Target environment (dev / test / prod)'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, test, prod]
+
+permissions:
+  id-token: write   # required for OIDC / Workload Identity Federation
+  contents: read
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  AZURE_RESOURCE_GROUP:  ${{ vars.AZURE_RESOURCE_GROUP }}
+  ACR_REGISTRY:          ${{ vars.ACR_REGISTRY }}           # e.g. myregistry.azurecr.io
+  FOUNDRY_ENDPOINT:      ${{ vars.FOUNDRY_ENDPOINT }}       # e.g. https://<hub>.services.ai.azure.com
+  AGENT_NAME:            ${{ vars.AGENT_NAME }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CI: Build · Validate · Evaluate
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  ci-build-validate:
+    name: 'CI — Build & Validate'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Static analysis ──────────────────────────────────────────────────
+      - name: Lint (ruff)
+        run: pip install ruff && ruff check .
+
+      - name: Security scan (bandit)
+        run: pip install bandit && bandit -r src/ -ll
+
+      - name: Validate agent YAML / prompt definitions
+        run: python scripts/validate_agent_config.py --config agent.yaml
+
+      # ── Unit & tool tests ────────────────────────────────────────────────
+      - name: Run unit tests
+        run: pytest tests/unit/ -v --tb=short
+
+      - name: Run tool integration tests
+        run: pytest tests/tools/ -v --tb=short
+        env:
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:  ${{ secrets.AZURE_OPENAI_API_KEY }}
+
+      # ── Docker build (hosted agents only) ───────────────────────────────
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build & push container image to ACR
+        run: |
+          az acr build \
+            --registry  ${{ env.ACR_REGISTRY }} \
+            --image     "${{ env.AGENT_NAME }}:${{ steps.tag.outputs.tag }}" \
+            --file      Dockerfile \
+            .
+
+  # ──────────────────────────────────────────────────────────────────────────
+  #  Evaluation gate — runs against fresh build
+  # ──────────────────────────────────────────────────────────────────────────
+  ci-evaluate:
+    name: 'CI — Agent Evaluation Gate'
+    needs: ci-build-validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install evaluation dependencies
+        run: pip install -r requirements-eval.txt
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run evaluation suite
+        id: eval
+        run: |
+          python scripts/run_evaluations.py \
+            --dataset   eval/datasets/golden_set.jsonl \
+            --output    eval/results/results.json \
+            --endpoint  ${{ env.FOUNDRY_ENDPOINT }}
+        env:
+          AZURE_AI_PROJECTS_CONNECTION_STRING: ${{ secrets.FOUNDRY_CONNECTION_STRING }}
+
+      - name: Enforce quality gates
+        run: |
+          python scripts/check_eval_gates.py \
+            --results         eval/results/results.json \
+            --max-hallucination  0.05 \
+            --min-task-completion 0.90 \
+            --max-latency-p95  4000
+        # Fails the pipeline if thresholds are breached
+
+      - name: Upload evaluation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-${{ github.sha }}
+          path: eval/results/
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CD: Deploy to Dev
+# ─────────────────────────────────────────────────────────────────────────────
+  cd-deploy-dev:
+    name: 'CD — Deploy to Dev'
+    needs: ci-evaluate
+    runs-on: ubuntu-latest
+    environment: dev
+    outputs:
+      agent_version: ${{ steps.deploy.outputs.agent_version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: pip }
+
+      - name: Install Azure AI SDK
+        run: pip install azure-ai-projects azure-identity
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy agent to Dev Foundry project
+        id: deploy
+        run: |
+          VERSION=$(python scripts/deploy_agent.py \
+            --env              dev \
+            --image            "${{ env.ACR_REGISTRY }}/${{ env.AGENT_NAME }}:${{ needs.ci-build-validate.outputs.image_tag }}" \
+            --foundry-endpoint ${{ vars.FOUNDRY_ENDPOINT_DEV }} \
+            --agent-config     agent.yaml)
+          echo "agent_version=$VERSION" >> "$GITHUB_OUTPUT"
+        env:
+          AZURE_AI_PROJECTS_CONNECTION_STRING: ${{ secrets.FOUNDRY_CONNECTION_STRING_DEV }}
+
+      - name: Smoke tests against Dev
+        run: |
+          pytest tests/smoke/ -v \
+            --endpoint ${{ vars.FOUNDRY_ENDPOINT_DEV }} \
+            --agent-version ${{ steps.deploy.outputs.agent_version }}
+        env:
+          AZURE_AI_PROJECTS_CONNECTION_STRING: ${{ secrets.FOUNDRY_CONNECTION_STRING_DEV }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CD: Promote to Test / QA
+# ─────────────────────────────────────────────────────────────────────────────
+  cd-deploy-test:
+    name: 'CD — Promote to Test/QA'
+    needs: cd-deploy-dev
+    runs-on: ubuntu-latest
+    environment: test      # requires approval gate in GitHub Environments
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: pip }
+
+      - name: Install Azure AI SDK
+        run: pip install azure-ai-projects azure-identity
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Promote agent version to Test project
+        run: |
+          python scripts/promote_agent.py \
+            --from-env       dev \
+            --to-env         test \
+            --agent-version  ${{ needs.cd-deploy-dev.outputs.agent_version }} \
+            --foundry-endpoint ${{ vars.FOUNDRY_ENDPOINT_TEST }}
+        env:
+          AZURE_AI_PROJECTS_CONNECTION_STRING: ${{ secrets.FOUNDRY_CONNECTION_STRING_TEST }}
+
+      - name: Run scenario tests + safety evaluation
+        run: |
+          python scripts/run_evaluations.py \
+            --dataset   eval/datasets/scenario_set.jsonl \
+            --output    eval/results/test-results.json \
+            --endpoint  ${{ vars.FOUNDRY_ENDPOINT_TEST }}
+        env:
+          AZURE_AI_PROJECTS_CONNECTION_STRING: ${{ secrets.FOUNDRY_CONNECTION_STRING_TEST }}
+
+      - name: Enforce Test quality gates
+        run: |
+          python scripts/check_eval_gates.py \
+            --results             eval/results/test-results.json \
+            --max-hallucination   0.03 \
+            --min-task-completion 0.95 \
+            --max-latency-p95     3000
+
+      - name: Upload Test evaluation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-eval-report-${{ needs.cd-deploy-dev.outputs.agent_version }}
+          path: eval/results/test-results.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CD: Deploy to Production (manual approval required)
+# ─────────────────────────────────────────────────────────────────────────────
+  cd-deploy-prod:
+    name: 'CD — Deploy to Production'
+    needs: cd-deploy-test
+    runs-on: ubuntu-latest
+    environment: production  # requires required reviewer approval in GitHub
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: pip }
+
+      - name: Install Azure AI SDK
+        run: pip install azure-ai-projects azure-identity
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Promote agent version to Production project
+        run: |
+          python scripts/promote_agent.py \
+            --from-env       test \
+            --to-env         prod \
+            --agent-version  ${{ needs.cd-deploy-dev.outputs.agent_version }} \
+            --foundry-endpoint ${{ vars.FOUNDRY_ENDPOINT_PROD }}
+        env:
+          AZURE_AI_PROJECTS_CONNECTION_STRING: ${{ secrets.FOUNDRY_CONNECTION_STRING_PROD }}
+
+      - name: Enable production endpoint
+        run: |
+          python scripts/enable_agent_endpoint.py \
+            --agent-version ${{ needs.cd-deploy-dev.outputs.agent_version }} \
+            --foundry-endpoint ${{ vars.FOUNDRY_ENDPOINT_PROD }}
+        env:
+          AZURE_AI_PROJECTS_CONNECTION_STRING: ${{ secrets.FOUNDRY_CONNECTION_STRING_PROD }}
+
+      - name: Post-deployment smoke test
+        run: |
+          pytest tests/smoke/ -v \
+            --endpoint ${{ vars.FOUNDRY_ENDPOINT_PROD }} \
+            --agent-version ${{ needs.cd-deploy-dev.outputs.agent_version }}
+        env:
+          AZURE_AI_PROJECTS_CONNECTION_STRING: ${{ secrets.FOUNDRY_CONNECTION_STRING_PROD }}

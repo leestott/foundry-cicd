@@ -1,0 +1,319 @@
+# Azure DevOps Pipeline — CI/CD for AI Agents on Microsoft Foundry
+# Mirrors the GitHub Actions pipeline with ADO-native gates and approvals
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - '**/*.md'
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: foundry-global               # Variable group: AZURE_SUBSCRIPTION_ID, ACR_REGISTRY, AGENT_NAME
+  - name: pythonVersion
+    value: '3.12'
+  - name: imageTag
+    value: $(Build.SourceVersion)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Stage 1: CI — Build, Validate, Evaluate
+# ─────────────────────────────────────────────────────────────────────────────
+stages:
+- stage: CI
+  displayName: 'CI — Build · Validate · Evaluate'
+  jobs:
+
+  - job: Build
+    displayName: 'Build & Static Validation'
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+        addToPath: true
+
+    - script: pip install -r requirements.txt
+      displayName: 'Install dependencies'
+
+    - script: pip install ruff && ruff check .
+      displayName: 'Lint (ruff)'
+
+    - script: pip install bandit && bandit -r src/ -ll
+      displayName: 'Security scan (bandit)'
+
+    - script: python scripts/validate_agent_config.py --config agent.yaml
+      displayName: 'Validate agent YAML / prompt definitions'
+
+    - script: pytest tests/unit/ -v --tb=short --junitxml=junit/unit-results.xml
+      displayName: 'Unit tests'
+
+    - script: pytest tests/tools/ -v --tb=short --junitxml=junit/tool-results.xml
+      displayName: 'Tool integration tests'
+      env:
+        AZURE_OPENAI_ENDPOINT: $(AZURE_OPENAI_ENDPOINT)
+        AZURE_OPENAI_API_KEY:  $(AZURE_OPENAI_API_KEY)
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: 'junit/*.xml'
+        mergeTestResults: true
+        testRunTitle: 'CI Unit & Tool Tests'
+
+    - task: AzureCLI@2
+      displayName: 'Build & push container image to ACR'
+      inputs:
+        azureSubscription: $(AZURE_SERVICE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr build \
+            --registry  $(ACR_REGISTRY) \
+            --image     "$(AGENT_NAME):$(imageTag)" \
+            --file      Dockerfile \
+            .
+
+  - job: Evaluate
+    displayName: 'Agent Evaluation Gate'
+    dependsOn: Build
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+
+    - script: pip install -r requirements-eval.txt
+      displayName: 'Install evaluation deps'
+
+    - task: AzureCLI@2
+      displayName: 'Run evaluation suite'
+      inputs:
+        azureSubscription: $(AZURE_SERVICE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          python scripts/run_evaluations.py \
+            --dataset   eval/datasets/golden_set.jsonl \
+            --output    eval/results/results.json \
+            --endpoint  $(FOUNDRY_ENDPOINT)
+      env:
+        AZURE_AI_PROJECTS_CONNECTION_STRING: $(FOUNDRY_CONNECTION_STRING)
+
+    - script: |
+        python scripts/check_eval_gates.py \
+          --results              eval/results/results.json \
+          --max-hallucination    0.05 \
+          --min-task-completion  0.90 \
+          --max-latency-p95      4000
+      displayName: 'Enforce quality gates'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'eval/results/'
+        artifactName: 'eval-report-ci'
+      displayName: 'Publish evaluation report'
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Stage 2: CD — Deploy to Dev
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: DeployDev
+  displayName: 'CD — Deploy to Dev'
+  dependsOn: CI
+  condition: succeeded()
+  variables:
+    - group: foundry-dev                # FOUNDRY_ENDPOINT_DEV, FOUNDRY_CONNECTION_STRING_DEV
+
+  jobs:
+  - deployment: DeployAgentDev
+    displayName: 'Deploy Agent to Dev Foundry Project'
+    pool:
+      vmImage: ubuntu-latest
+    environment: 'foundry-dev'         # ADO environment with approval policy
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: pip install azure-ai-projects azure-identity
+            displayName: 'Install Azure AI SDK'
+
+          - task: AzureCLI@2
+            name: DeployAgent
+            displayName: 'Deploy agent version to Dev'
+            inputs:
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                VERSION=$(python scripts/deploy_agent.py \
+                  --env              dev \
+                  --image            "$(ACR_REGISTRY)/$(AGENT_NAME):$(imageTag)" \
+                  --foundry-endpoint $(FOUNDRY_ENDPOINT_DEV) \
+                  --agent-config     agent.yaml)
+                echo "##vso[task.setvariable variable=agentVersion;isOutput=true]$VERSION"
+            env:
+              AZURE_AI_PROJECTS_CONNECTION_STRING: $(FOUNDRY_CONNECTION_STRING_DEV)
+
+          - script: |
+              pytest tests/smoke/ -v \
+                --endpoint $(FOUNDRY_ENDPOINT_DEV) \
+                --agent-version $(DeployAgent.agentVersion)
+            displayName: 'Smoke tests — Dev'
+            env:
+              AZURE_AI_PROJECTS_CONNECTION_STRING: $(FOUNDRY_CONNECTION_STRING_DEV)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Stage 3: CD — Promote to Test / QA
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: DeployTest
+  displayName: 'CD — Promote to Test/QA'
+  dependsOn: DeployDev
+  condition: succeeded()
+  variables:
+    - group: foundry-test               # FOUNDRY_ENDPOINT_TEST, FOUNDRY_CONNECTION_STRING_TEST
+
+  jobs:
+  - deployment: DeployAgentTest
+    displayName: 'Promote Agent to Test Foundry Project'
+    pool:
+      vmImage: ubuntu-latest
+    environment: 'foundry-test'        # ADO environment — add required approvers here
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: pip install azure-ai-projects azure-identity azure-ai-evaluation
+            displayName: 'Install Azure AI SDK + Evaluation'
+
+          - task: AzureCLI@2
+            displayName: 'Promote agent version to Test'
+            inputs:
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                python scripts/promote_agent.py \
+                  --from-env        dev \
+                  --to-env          test \
+                  --agent-version   $(agentVersion) \
+                  --foundry-endpoint $(FOUNDRY_ENDPOINT_TEST)
+            env:
+              AZURE_AI_PROJECTS_CONNECTION_STRING: $(FOUNDRY_CONNECTION_STRING_TEST)
+
+          - task: AzureCLI@2
+            displayName: 'Scenario tests + safety evaluation'
+            inputs:
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                python scripts/run_evaluations.py \
+                  --dataset  eval/datasets/scenario_set.jsonl \
+                  --output   eval/results/test-results.json \
+                  --endpoint $(FOUNDRY_ENDPOINT_TEST)
+            env:
+              AZURE_AI_PROJECTS_CONNECTION_STRING: $(FOUNDRY_CONNECTION_STRING_TEST)
+
+          - script: |
+              python scripts/check_eval_gates.py \
+                --results              eval/results/test-results.json \
+                --max-hallucination    0.03 \
+                --min-task-completion  0.95 \
+                --max-latency-p95      3000
+            displayName: 'Enforce Test quality gates'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: 'eval/results/test-results.json'
+              artifactName: 'eval-report-test'
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Stage 4: CD — Deploy to Production (approval gate)
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: DeployProd
+  displayName: 'CD — Deploy to Production'
+  dependsOn: DeployTest
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  variables:
+    - group: foundry-prod               # FOUNDRY_ENDPOINT_PROD, FOUNDRY_CONNECTION_STRING_PROD
+
+  jobs:
+  - deployment: DeployAgentProd
+    displayName: 'Deploy Agent to Production Foundry Project'
+    pool:
+      vmImage: ubuntu-latest
+    environment: 'foundry-production'  # ADO environment — add required approvers + deployment strategy
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: pip install azure-ai-projects azure-identity
+            displayName: 'Install Azure AI SDK'
+
+          - task: AzureCLI@2
+            displayName: 'Promote agent version to Production'
+            inputs:
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                python scripts/promote_agent.py \
+                  --from-env         test \
+                  --to-env           prod \
+                  --agent-version    $(agentVersion) \
+                  --foundry-endpoint $(FOUNDRY_ENDPOINT_PROD)
+            env:
+              AZURE_AI_PROJECTS_CONNECTION_STRING: $(FOUNDRY_CONNECTION_STRING_PROD)
+
+          - task: AzureCLI@2
+            displayName: 'Enable production endpoint'
+            inputs:
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                python scripts/enable_agent_endpoint.py \
+                  --agent-version    $(agentVersion) \
+                  --foundry-endpoint $(FOUNDRY_ENDPOINT_PROD)
+            env:
+              AZURE_AI_PROJECTS_CONNECTION_STRING: $(FOUNDRY_CONNECTION_STRING_PROD)
+
+          - script: |
+              pytest tests/smoke/ -v \
+                --endpoint $(FOUNDRY_ENDPOINT_PROD) \
+                --agent-version $(agentVersion)
+            displayName: 'Post-deployment smoke test — Production'
+            env:
+              AZURE_AI_PROJECTS_CONNECTION_STRING: $(FOUNDRY_CONNECTION_STRING_PROD)

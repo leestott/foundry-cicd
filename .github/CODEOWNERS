@@ -1,0 +1,12 @@
+# Default owners for all files
+* @leestott
+
+# Pipeline definitions
+azure-devops-pipeline.yml @leestott
+github-actions-pipeline.yml @leestott
+
+# Governance docs
+README.md @leestott
+SECURITY.md @leestott
+CONTRIBUTING.md @leestott
+LICENSE @leestott
