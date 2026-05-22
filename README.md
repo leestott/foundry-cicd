@@ -12,30 +12,6 @@ Reference blog post:
 
 - [CI/CD for AI Agents on Microsoft Foundry](https://techcommunity.microsoft.com/blog/educatordeveloperblog/cicd-for-ai-agents-on-microsoft-foundry/4522218)
 
-## Repository Metadata
-
-Description:
-
-Enterprise-ready CI/CD reference for Microsoft Foundry AI agents, with parallel GitHub Actions and Azure DevOps pipelines, evaluation-driven quality gates, and controlled promotion across Dev, Test, and Production.
-
-Suggested tags/topics:
-
-- microsoft-foundry
-- ai-agents
-- cicd
-- github-actions
-- azure-devops
-- azure
-- mlops
-- llmops
-- responsible-ai
-- agent-evaluation
-- devsecops
-- yaml-pipelines
-- python
-- enterprise-architecture
-- reference-implementation
-
 ## Architecture
 
 ![Reference Architecture](architecture-diagram.png)
